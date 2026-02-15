@@ -118,7 +118,7 @@ jobs:
             pr_url=$(gh pr create \
               --base main \
               --head "$CONFLICT_BRANCH" \
-              --title "⚠️ CONFLICT: Sync release to main (v$VERSION)" \
+              --title "⚠️ Sync release to main (v$VERSION)" \
               --body "Automated direct merge failed due to Git conflicts. Please resolve these conflicts manually and merge this PR to keep main up to date with production." \
               --reviewer "$TEAM_REVIEWER")
           
