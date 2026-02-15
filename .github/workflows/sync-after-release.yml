@@ -1,0 +1,126 @@
+name: Sync Branches After Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number'
+        required: true
+        type: string
+
+jobs:
+  sync-branches:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. GENERATE THE APP TOKEN
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.SYNC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SYNC_RELEASE_APP_PRIVATE_KEY }}
+
+      # 2. CHECKOUT CODE
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Configure Git Bot
+        run: |
+          git config user.name "${{ steps.app-token.outputs.app-slug }}[bot]"
+          git config user.email "${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com"
+
+      # 3. WAIT FOR CHECKS ON RC BRANCH
+      - name: Wait for Status Checks on Release Candidate Branch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          RC_BRANCH="releases/v$VERSION"
+
+          echo "Waiting for status checks on $RC_BRANCH..."
+          COMMIT_SHA=$(git rev-parse "origin/$RC_BRANCH")
+
+          MAX_ATTEMPTS=60
+          ATTEMPT=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            CHECK_RUNS=$(gh api "repos/${{ github.repository }}/commits/$COMMIT_SHA/check-runs" --jq '.check_runs')
+            TOTAL_CHECKS=$(echo "$CHECK_RUNS" | jq 'length')
+          
+            if [ "$TOTAL_CHECKS" -eq 0 ]; then
+              sleep 10
+              ATTEMPT=$((ATTEMPT + 1))
+              continue
+            fi
+
+            INCOMPLETE=$(echo "$CHECK_RUNS" | jq '[.[] | select(.status != "completed")] | length')
+            if [ "$INCOMPLETE" -gt 0 ]; then
+              sleep 10
+              ATTEMPT=$((ATTEMPT + 1))
+              continue
+            fi
+
+            FAILED=$(echo "$CHECK_RUNS" | jq '[.[] | select(.conclusion != "success" and .conclusion != "skipped")] | length')
+            if [ "$FAILED" -gt 0 ]; then
+              echo "RC Check runs failed! Aborting sync."
+              exit 1
+            fi
+
+            echo "All check runs passed on RC branch!"
+            break
+          done
+
+      # 4. MERGE RC TO RELEASE
+      - name: Merge RC to Release Branch
+        run: |
+          VERSION="${{ inputs.version }}"
+          RC_BRANCH="releases/v$VERSION"
+          
+          git checkout release
+          git merge "origin/$RC_BRANCH" --no-edit
+          git push origin release
+
+      # 5. DIRECT MERGE TO MAIN WITH CONFLICT FALLBACK
+      - name: Sync Release to Main
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TEAM_REVIEWER: "test-merge-app/backend"
+        run: |
+          VERSION="${{ inputs.version }}"
+          
+          echo "Attempting direct merge from release to main..."
+          git checkout main
+          
+          # Try to merge release into main. 
+          # If it fails, the 'if' condition routes to the 'else' block.
+          if git merge origin/release --no-edit; then
+            echo "✅ No conflicts! Pushing directly to main."
+            # The App token bypasses branch protection rules here
+            git push origin main
+          
+          else
+            echo "⚠️ Merge conflict detected! Aborting direct merge."
+            # Clean up the broken merge state locally
+            git merge --abort
+          
+            CONFLICT_BRANCH="sync-release-to-main-v$VERSION"
+            echo "Creating fallback PR branch: $CONFLICT_BRANCH"
+          
+            # Create a new branch originating from the release branch tip
+            git checkout -b "$CONFLICT_BRANCH" origin/release
+            git push origin "$CONFLICT_BRANCH"
+          
+            echo "Creating PR and requesting review from $TEAM_REVIEWER..."
+          
+            pr_url=$(gh pr create \
+              --base main \
+              --head "$CONFLICT_BRANCH" \
+              --title "⚠️ CONFLICT: Sync release to main (v$VERSION)" \
+              --body "Automated direct merge failed due to Git conflicts. Please resolve these conflicts manually and merge this PR to keep main up to date with production." \
+              --reviewer "$TEAM_REVIEWER")
+          
+            echo "PR Created successfully: $pr_url"
+          fi
